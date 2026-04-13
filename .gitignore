@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+venv/
+ms_env/
+
+nutrition_label_detector/dataset/
+nutrition_label_detector/runs/
+
 # C extensions
 *.so
 
@@ -179,3 +185,4 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
