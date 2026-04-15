@@ -53,11 +53,6 @@ def detect_label(image_path):
     crop.save(crop_output_path)
     print(f"Saved cropped label to: {crop_output_path}")
 
-    try:
-        crop.show()
-    except Exception as exc:
-        print(f"Could not open crop preview window: {exc}")
-
     return crop
 
 
@@ -125,8 +120,65 @@ def extract_nutrition(image_path):
 
 
 # -----------------------
-# run
+# Debug mode - run this file directly to test OCR with webcam
 # -----------------------
-result = extract_nutrition("nutrition_label_detector/0.jpg")
+if __name__ == "__main__":
+    import cv2
+    
+    # Capture image from webcam
+    print("Opening webcam for capture...")
+    image_path = "debug_meal_image.jpg"
+    
+    cap = cv2.VideoCapture(1)
+    
+    if not cap.isOpened():
+        print("Error: Could not open webcam")
+        exit(1)
 
-print(result)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    print("Webcam opened. Press SPACE to capture or Q to quit.")
+    
+    captured = False
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret:
+            cap.release()
+            print("Error: Could not read frame")
+            exit(1)
+        
+        # Display the frame
+        cv2.imshow("Webcam - Press SPACE to capture, Q to quit", frame)
+        
+        # Wait for key press
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord(' '):  # SPACE key to capture
+            cv2.imwrite(image_path, frame)
+            print(f"Image saved to {image_path}")
+            captured = True
+            break
+        elif key == ord('q'):  # Q key to quit
+            print("Cancelled")
+            cap.release()
+            cv2.destroyAllWindows()
+            exit(0)
+    
+    # Release the webcam and close windows
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    if not captured:
+        exit(1)
+    
+    print(f"Testing OCR on: {image_path}\n")
+    
+    try:
+        result = extract_nutrition(image_path)
+        print("\n--- FINAL EXTRACTED NUTRIENTS ---")
+        for nutrient, value in result.items():
+            print(f"  {nutrient}: {value}")
+    except Exception as e:
+        print(f"Error: {e}")

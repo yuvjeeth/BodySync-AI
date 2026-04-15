@@ -4,7 +4,6 @@
 
 langchain
 langchain-community
-langchain-anthropic
 python-dotenv
 pydantic
 groq

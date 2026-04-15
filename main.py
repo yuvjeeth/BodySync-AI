@@ -3,7 +3,7 @@ import json
 from groq import Groq
 from pydantic import BaseModel
 from langchain_core.output_parsers import PydanticOutputParser
-from tools import webcam_capture_image
+from tools import webcam_capture_image, capture_and_extract_nutrition
 
 class LLMResponse(BaseModel):
     topic: str
@@ -35,12 +35,25 @@ tools = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "capture_and_extract_nutrition",
+            "description": "Opens the webcam to capture an image of a nutrition label, then uses OCR and AI to extract nutrition information from the label. Returns parsed nutritional values like calories, fat, carbs, and protein.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
     }
 ]
 
 # Map tool names to functions
 available_functions = {
-    "webcam_capture_image": webcam_capture_image
+    "webcam_capture_image": webcam_capture_image,
+    "capture_and_extract_nutrition": capture_and_extract_nutrition
 }
 
 formatInstructions = parser.get_format_instructions()
