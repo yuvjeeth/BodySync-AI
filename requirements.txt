@@ -7,8 +7,12 @@ langchain-community
 python-dotenv
 pydantic
 groq
-opencv-python
+numpy==1.26.4
+opencv-python==4.10.0.84
 ultralytics 
+paddlepaddle==2.6.2
+paddleocr==2.7.3
+rapidfuzz
 datasets 
 pillow 
 torch 
