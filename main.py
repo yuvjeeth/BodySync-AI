@@ -3,7 +3,7 @@ import json
 from groq import Groq
 from pydantic import BaseModel
 from langchain_core.output_parsers import PydanticOutputParser
-from tools import webcam_capture_image, capture_and_extract_nutrition
+from bodysync_tools import webcam_capture_image, capture_and_extract_nutrition, capture_and_analyze_body
 
 class LLMResponse(BaseModel):
     topic: str
@@ -14,8 +14,21 @@ class LLMResponse(BaseModel):
 
 parser = PydanticOutputParser(pydantic_object=LLMResponse)
 
-# 1. Set your API Key
-client = Groq(api_key='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')
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    # dotenv is optional; environment variables can be provided by the shell instead.
+    pass
+
+api_key = os.environ.get("GROQ_API_KEY")
+if not api_key:
+    raise RuntimeError(
+        "Missing GROQ_API_KEY. Create a .env file with GROQ_API_KEY=... or set it in your environment."
+    )
+
+client = Groq(api_key=api_key)
 
 # Define available tools
 tools = [
@@ -48,12 +61,26 @@ tools = [
             }
         }
     }
+    ,
+    {
+        "type": "function",
+        "function": {
+            "name": "capture_and_analyze_body",
+            "description": "Opens the webcam to capture a full-body image, runs pose estimation to compute normalized body ratios, and returns a baseline somatotype estimate (heuristic).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    }
 ]
 
 # Map tool names to functions
 available_functions = {
     "webcam_capture_image": webcam_capture_image,
-    "capture_and_extract_nutrition": capture_and_extract_nutrition
+    "capture_and_extract_nutrition": capture_and_extract_nutrition,
+    "capture_and_analyze_body": capture_and_analyze_body,
 }
 
 formatInstructions = parser.get_format_instructions()

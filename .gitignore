@@ -186,3 +186,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local demo artifacts (webcam captures, generated overlays, downloaded models)
+body_image*.jpg
+models/*.task
+
