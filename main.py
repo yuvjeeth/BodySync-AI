@@ -3,7 +3,13 @@ import json
 from groq import Groq
 from pydantic import BaseModel
 from langchain_core.output_parsers import PydanticOutputParser
-from bodysync_tools import webcam_capture_image, capture_and_extract_nutrition, capture_and_analyze_body
+from bodysync_tools import (
+    webcam_capture_image,
+    capture_and_extract_nutrition,
+    capture_and_analyze_body,
+    extract_nutrition_from_file,
+    analyze_body_from_file
+)
 
 class LLMResponse(BaseModel):
     topic: str
@@ -16,7 +22,6 @@ parser = PydanticOutputParser(pydantic_object=LLMResponse)
 
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     # dotenv is optional; environment variables can be provided by the shell instead.
@@ -30,21 +35,39 @@ if not api_key:
 
 client = Groq(api_key=api_key)
 
-# Define available tools
+# Define available tools for the agent
 tools = [
+    # ============================================================
+    # IMAGE CAPTURE TOOL
+    # ============================================================
     {
         "type": "function",
         "function": {
             "name": "webcam_capture_image",
-            "description": "Opens the webcam, allows the user to take a picture, and saves it. The user must press SPACE to capture the image.",
+            "description": "Opens the webcam and allows the user to capture a photo. Press SPACE to capture, Q to quit. Useful for taking photos of nutrition labels, body images, or general photography.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "output_path": {
                         "type": "string",
-                        "description": "Path where the captured image will be saved. Default is 'captured_image.jpg'"
+                        "description": "File path where the captured image will be saved (e.g., 'my_photo.jpg')"
                     }
                 },
+                "required": []
+            }
+        }
+    },
+    # ============================================================
+    # NUTRITION OCR TOOLS
+    # ============================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "capture_and_extract_nutrition",
+            "description": "Captures a nutrition label image from the webcam and automatically extracts nutritional information using OCR and AI. Detects: calories, total fat, carbohydrates, and protein. Best for food packaging nutrition labels.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
                 "required": []
             }
         }
@@ -52,62 +75,105 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "capture_and_extract_nutrition",
-            "description": "Opens the webcam to capture an image of a nutrition label, then uses OCR and AI to extract nutrition information from the label. Returns parsed nutritional values like calories, fat, carbs, and protein.",
+            "name": "extract_nutrition_from_file",
+            "description": "Extracts nutrition information from a nutrition label image using OCR and AI. Provide an image file path containing a nutrition label. Returns: calories, fat, carbohydrates, and protein values.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to the nutrition label image file (e.g., 'nutrition_label.jpg' or '/path/to/label.png')"
+                    }
+                },
+                "required": ["image_path"]
+            }
+        }
+    },
+    # ============================================================
+    # POSE ESTIMATION & BODY ANALYSIS TOOLS
+    # ============================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "capture_and_analyze_body",
+            "description": "Captures a full-body image from the webcam and analyzes body measurements using pose estimation. Computes body ratios (shoulder width, hip width, torso length, shoulder-to-hip ratio) and estimates somatotype (ectomorph, mesomorph, or endomorph). User should stand straight and face the camera.",
             "parameters": {
                 "type": "object",
                 "properties": {},
                 "required": []
             }
         }
-    }
-    ,
+    },
     {
         "type": "function",
         "function": {
-            "name": "capture_and_analyze_body",
-            "description": "Opens the webcam to capture a full-body image, runs pose estimation to compute normalized body ratios, and returns a baseline somatotype estimate (heuristic).",
+            "name": "analyze_body_from_file",
+            "description": "Analyzes body measurements and pose from an existing image file using pose estimation. Computes normalized body ratios and estimates somatotype. Requires a clear full-body image where the person faces the camera.",
             "parameters": {
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to the full-body image file (e.g., 'body_photo.jpg' or '/path/to/body.png')"
+                    }
+                },
+                "required": ["image_path"]
             }
         }
     }
 ]
 
-# Map tool names to functions
+# Map tool names to function implementations
 available_functions = {
     "webcam_capture_image": webcam_capture_image,
     "capture_and_extract_nutrition": capture_and_extract_nutrition,
+    "extract_nutrition_from_file": extract_nutrition_from_file,
     "capture_and_analyze_body": capture_and_analyze_body,
+    "analyze_body_from_file": analyze_body_from_file,
 }
 
 formatInstructions = parser.get_format_instructions()
 
-systemMessage = {"role": "system", "content":f"""You are a helpful, enthusiastic fitness assistant. 
-                 You will provide information about fitness topics, suggest diets, 
-                 and suggest workout routines based on user queries. Your general tone should be welcoming and motivational. 
-                 You should gather the following information from the user initially:
-                 Their name, age, gender, height, weight, what their current activity level is, and what is their fitness goal.
-                 Take that response and then ask them what their current meals are, and ask for dietary restrictions.
-                 Suggest them home-cookable meals by taking their grocery store preference.
-                 
-                 You have access to a webcam tool that can take photos. Use it when the user asks you to click a photo or take a picture."""}
+systemMessage = {"role": "system", "content": f"""You are a helpful, enthusiastic fitness and nutrition assistant. You provide personalized fitness and dietary guidance.
+
+Your capabilities:
+1. NUTRITION ANALYSIS: Use OCR tools to extract and analyze nutrition information from food labels
+2. BODY ANALYSIS: Use pose estimation tools to assess body composition and estimates somatotype
+3. FITNESS GUIDANCE: Provide workout recommendations, diet plans, and fitness tips
+
+Initial Assessment Process:
+- Ask the user for: name, age, gender, height, weight, current activity level, and fitness goals
+- Once you have basic info, ask about: current meals, dietary restrictions, and grocery preferences
+- Use your tools when the user asks to analyze nutrition labels or body measurements
+
+Tool Usage Guidelines:
+- When user asks to "take a photo", "capture an image", or "scan a label" → use webcam_capture_image or the specialized capture tools
+- When user has an existing photo → ask for the file path and use the extract_nutrition_from_file or analyze_body_from_file tools
+- Explain what each tool will do before using it
+- After getting results, provide personalized advice based on the data
+
+Tone: Be motivational, supportive, and practical. Avoid making definitive health claims."""}
 
 userMessages = [
-            {"role": "user", "content": "Hello! Can you confirm you are working? You're awesome!"}
-        ]
+    {"role": "user", "content": "Hello! Can you confirm you are working? You're awesome!"}
+]
 
 try:
     # Conversation loop
-    print("Chat started! Type 'quit' to exit.\n")
+    print("=" * 60)
+    print("FITNESS & NUTRITION ASSISTANT")
+    print("=" * 60)
+    print("\nChat started! Type 'quit' to exit.\n")
+    
     while True:
         # Get user input
-        user_input = input("You: ")
+        user_input = input("You: ").strip()
+        
+        if not user_input:
+            continue
         
         if user_input.lower() == 'quit':
-            print("Exiting chat...")
+            print("Thank you for using the fitness assistant. Stay healthy!")
             break
         
         # Add user message to conversation history
@@ -119,8 +185,8 @@ try:
                 model="llama-3.1-8b-instant",
                 messages=[systemMessage] + userMessages,
                 tools=tools,
-                temperature=0.5,
-                max_tokens=1024,
+                temperature=0.7,
+                max_tokens=2048,
             )
             
             response_message = completion.choices[0].message
@@ -130,7 +196,7 @@ try:
                 # Add assistant response to messages
                 userMessages.append({
                     "role": "assistant",
-                    "content": response_message.content,
+                    "content": response_message.content if response_message.content else "",
                     "tool_calls": [
                         {
                             "id": tool_call.id,
@@ -153,17 +219,28 @@ try:
                     
                     # Execute the tool
                     if tool_name in available_functions:
-                        tool_result = available_functions[tool_name](**tool_args)
-                        
-                        # Add tool result to messages
-                        userMessages.append({
-                            "role": "user",
-                            "content": f"Tool '{tool_name}' result: {tool_result}"
-                        })
+                        try:
+                            tool_result = available_functions[tool_name](**tool_args)
+                            print(f"[Tool result]: Success\n")
+                            
+                            # Add tool result to messages
+                            userMessages.append({
+                                "role": "user",
+                                "content": f"Tool result from '{tool_name}':\n{tool_result}"
+                            })
+                        except Exception as tool_error:
+                            error_msg = f"Tool execution error: {str(tool_error)}"
+                            print(f"[Tool error]: {error_msg}\n")
+                            userMessages.append({
+                                "role": "user",
+                                "content": f"Error executing tool '{tool_name}': {error_msg}"
+                            })
                     else:
+                        error_msg = f"Tool '{tool_name}' not found in available functions"
+                        print(f"[Tool error]: {error_msg}\n")
                         userMessages.append({
                             "role": "user",
-                            "content": f"Error: Tool '{tool_name}' not found"
+                            "content": error_msg
                         })
                 
                 # Continue the loop to get the next response
@@ -173,11 +250,15 @@ try:
                 break
         
         # Extract and display final response
-        raw_response = response_message.content
+        raw_response = response_message.content or "(No response)"
         print(f"\nAssistant: {raw_response}\n")
         
         # Add assistant response to conversation history
         userMessages.append({"role": "assistant", "content": raw_response})
 
+except KeyboardInterrupt:
+    print("\n\nChat interrupted. Goodbye!")
 except Exception as e:
     print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()

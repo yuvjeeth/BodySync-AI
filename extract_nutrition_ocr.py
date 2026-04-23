@@ -1,492 +1,491 @@
-from ultralytics import YOLO
-from PIL import Image
+import cv2
 import re
 import os
-import cv2
+import easyocr
 import numpy as np
-from rapidfuzz import fuzz
-
-# -----------------------
-# Paddle setup
-# -----------------------
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["FLAGS_enable_pir_api"] = "0"
-os.environ["FLAGS_enable_pir_in_executor"] = "0"
-
-from paddleocr import PaddleOCR
-import paddle
-
-SAVE_PREPROCESSED = os.environ.get("SAVE_PREPROCESSED", "1") == "1"
-
-try:
-    paddle.set_flags(
-        {
-            "FLAGS_use_mkldnn": 0,
-            "FLAGS_enable_pir_api": 0,
-            "FLAGS_enable_pir_in_executor": 0,
-        }
-    )
-except Exception:
-    pass
-
-def select_paddle_device():
-    if hasattr(paddle, "device") and paddle.device.is_compiled_with_cuda():
-        try:
-            paddle.set_device("gpu:0")
-            return "gpu:0"
-        except Exception:
-            pass
-    paddle.set_device("cpu")
-    return "cpu"
-
-PADDLE_DEVICE = select_paddle_device()
-
-# -----------------------
-# camera helper
-# -----------------------
-def open_available_camera(indices=(0, 1, 2, 3)):
-    for idx in indices:
-        cap = cv2.VideoCapture(idx)
-        if cap.isOpened():
-            return cap, idx
-        cap.release()
-    return None, None
-
-
-def capture_image_from_webcam(image_path="debug_meal_image.jpg"):
-    print("Opening webcam for capture...")
-
-    cap, camera_index = open_available_camera()
-
-    if cap is None:
-        print("Error: Could not open webcam (tried indices 0, 1, 2, 3)")
-        exit(1)
-
-    # Request 1080p capture and a codec/fps combination many webcams support.
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FPS, 15)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Camera resolution: {actual_w}x{actual_h}")
-
-    # Let autofocus and auto-exposure settle before user capture.
-    for _ in range(20):
-        cap.read()
-
-    print(f"Webcam opened on index {camera_index}. Press SPACE to capture or Q to quit.")
-
-    def sharpness_score(f):
-        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    captured = False
-    while True:
-        ret, frame = cap.read()
-
-        if not ret:
-            cap.release()
-            print("Error: Could not read frame")
-            exit(1)
-
-        score = sharpness_score(frame)
-        score_text = f"Sharpness: {score:.0f}"
-        quality_text = "Good" if score >= 220 else "Adjust focus"
-
-        cv2.putText(frame, score_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(frame, quality_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-
-        # Display the frame with sharpness feedback.
-        cv2.imshow("Webcam - Press SPACE to capture, Q to quit", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord(' '):  # SPACE key to capture
-            # Capture a short burst and save the sharpest frame to reduce blur.
-            burst_frames = []
-            for _ in range(6):
-                ok, burst = cap.read()
-                if ok:
-                    burst_frames.append(burst)
-
-            if burst_frames:
-                frame_to_save = max(burst_frames, key=sharpness_score)
-            else:
-                frame_to_save = frame
-
-            cv2.imwrite(image_path, frame_to_save)
-            print(f"Image saved to {image_path}")
-            captured = True
-            break
-        elif key == ord('q'):  # Q key to quit
-            print("Cancelled")
-            cap.release()
-            cv2.destroyAllWindows()
-            exit(0)
-
-    # Release the webcam and close windows
-    cap.release()
-    cv2.destroyAllWindows()
-
-    if not captured:
-        exit(1)
-
-    return image_path
-
-def create_ocr_engine():
-    kwargs = {"lang": "en", "use_textline_orientation": True}
-    if PADDLE_DEVICE.startswith("gpu"):
-        try:
-            return PaddleOCR(device=PADDLE_DEVICE, **kwargs)
-        except TypeError:
-            return PaddleOCR(use_gpu=True, **kwargs)
-    return PaddleOCR(**kwargs)
-
-# -----------------------
-# load detector
-# -----------------------
-detector = YOLO("nutrition_label_detector/nutrition_label_detector_baseline.pt")
-
-# -----------------------
-# OCR engine
-# -----------------------
-ocr_engine = create_ocr_engine()
-
-# -----------------------
-# detect nutrition label
-# -----------------------
-def detect_label(image_path):
-    results = detector(image_path)[0]
-
-    if len(results.boxes) == 0:
-        raise ValueError("No nutrition label detected")
-
-    box = results.boxes.xyxy[0].tolist()
-    img = Image.open(image_path).convert("RGB")
-    crop = img.crop(box)
-    return crop
-
-# -----------------------
-# preprocessing
-# -----------------------
-def preprocess(pil_img):
-    img = np.array(pil_img)
-
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    # Upscale only when the source is not already large.
-    h, w = gray.shape[:2]
-    if max(h, w) < 2000:
-        gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-
-    # mild denoise
-    gray = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-
-    # Keep OCR input under model-side max limits to avoid internal resize paths.
-    h, w = gray.shape[:2]
-    max_side = max(h, w)
-    max_side_limit = 3800
-    if max_side > max_side_limit:
-        scale = max_side_limit / float(max_side)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    return gray
-
-def build_ocr_variants(pil_img):
-    base = preprocess(pil_img)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    boosted = clahe.apply(base)
-
-    binary = cv2.adaptiveThreshold(
-        boosted, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31, 8
-    )
-
-    return [base, binary]
-
-
-def save_preprocessed_variants(variants, out_dir="debug_preprocessed"):
-    os.makedirs(out_dir, exist_ok=True)
-    output_paths = []
-
-    names = ["01_gray", "02_binary"]
-    for idx, img in enumerate(variants):
-        name = names[idx] if idx < len(names) else f"{idx+1:02d}"
-        path = os.path.join(out_dir, f"{name}.png")
-        cv2.imwrite(path, img)
-        output_paths.append(path)
-
-    return output_paths
-
-# -----------------------
-# OCR helpers
-# -----------------------
-def extract_lines(result, min_conf=0.3):
-    lines = []
-
-    for item in result:
-        if isinstance(item, dict):
-            texts = item.get("rec_texts", [])
-            scores = item.get("rec_scores", [])
-            for i, t in enumerate(texts):
-                if t and (i >= len(scores) or scores[i] >= min_conf):
-                    lines.append(str(t))
-        elif isinstance(item, list):
-            for w in item:
-                if isinstance(w, (list, tuple)) and len(w) > 1:
-                    t = w[1][0]
-                    s = w[1][1] if len(w[1]) > 1 else 1.0
-                    if t and s >= min_conf:
-                        lines.append(str(t))
-
-    return lines
-
-def run_ocr(image):
-    variants = build_ocr_variants(image)
-    if SAVE_PREPROCESSED:
-        saved_paths = save_preprocessed_variants(variants)
-        print("Saved preprocessed images:")
-        for path in saved_paths:
-            print(f"- {path}")
-
-    # Prefer the first OCR pass; only use second pass when the first is too sparse.
-    primary_img = cv2.cvtColor(variants[0], cv2.COLOR_GRAY2BGR)
-    if hasattr(ocr_engine, "predict"):
-        primary_result = ocr_engine.predict(primary_img)
-    else:
-        primary_result = ocr_engine.ocr(primary_img, cls=True)
-
-    primary_lines = extract_lines(primary_result)
-    primary_lines = [l for l in primary_lines if l.strip()]
-
-    # If first pass is strong enough, avoid mixing in noisy second-pass text.
-    if len(primary_lines) >= 8:
-        merged = primary_lines
-    else:
-        seen = set()
-        merged = []
-
-        for l in primary_lines:
-            key = l.lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                merged.append(l)
-
-        secondary_img = cv2.cvtColor(variants[1], cv2.COLOR_GRAY2BGR)
-        if hasattr(ocr_engine, "predict"):
-            secondary_result = ocr_engine.predict(secondary_img)
-        else:
-            secondary_result = ocr_engine.ocr(secondary_img, cls=True)
-
-        secondary_lines = extract_lines(secondary_result)
-        for l in secondary_lines:
-            key = l.lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                merged.append(l)
-
-    full_text = "\n".join(merged)
-    print("\n--- OCR OUTPUT ---")
-    print(full_text)
-    print("------------------\n")
-
-    return full_text.lower()
-
-# -----------------------
-# RAPIDFUZZ + CONTEXT PARSER
-# -----------------------
-NUTRIENTS = {
-    "calories": ["calories", "calorie", "energy"],
-    "fat": ["total fat", "fat"],
-    "carbohydrates": ["total carbohydrate", "carbohydrate", "carb"],
-    "protein": ["protein"],
-}
-
-def find_best_index(lines, keywords):
-    best_score = 0
-    best_idx = None
-
-    for i, line in enumerate(lines):
-        for kw in keywords:
-            score = fuzz.partial_ratio(kw, line)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-
-    return best_idx if best_score > 65 else None
-
-def extract_value_from_context(lines, idx, expect_g):
-    if idx is None:
-        return None
-
-    def normalize_units(line):
-        line = line.lower()
-        line = re.sub(r'(\d)\s*[q9o]\b', r'\1g', line)
-        line = re.sub(r'\b[il]\s*g\b', '1g', line)
-        line = re.sub(r'\bo\s*g\b', '0g', line)
-        line = re.sub(r'\bog\b', '0g', line)
-        return line
-
-    # Prefer same line, then nearest neighbors.
-    offsets = [0, -1, 1, -2, 2] if expect_g else [0, 1, -1, 2, -2, 3, -3]
-    for offset in offsets:
-        j = idx + offset
-        if not (0 <= j < len(lines)):
+
+reader = easyocr.Reader(['en'], gpu=False)
+
+# -------------------------
+# PERSPECTIVE HELPERS
+# -------------------------
+def order_points(pts):
+    rect = np.zeros((4, 2), dtype="float32")
+
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+
+    return rect
+
+
+def perspective_transform(image, pts):
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
+
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]
+    ], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+
+    return warped
+
+
+# -------------------------
+# OCR-BASED CONTOUR DETECTION (FIXED)
+# -------------------------
+def detect_document_contour(image):
+    results = reader.readtext(image)
+
+    points = []
+
+    for (bbox, text, conf) in results:
+        if not bbox or len(bbox) < 4:
             continue
 
-        line = normalize_units(lines[j])
+        for pt in bbox:
+            points.append(pt)
 
-        if expect_g:
-            # For gram nutrients, only accept values tied to a g-like unit.
-            m = re.search(r'(\d+(?:\.\d+)?)\s*g\b', line)
-            if m:
-                return m.group(1)
-            # If OCR dropped the unit on the matched nutrient line, use same-line number.
-            if offset == 0:
-                m = re.search(r'(\d+(?:\.\d+)?)', line)
-                if m:
-                    return m.group(1)
+    if len(points) < 4:
+        return None
+
+    pts = np.array(points, dtype=np.float32)
+
+    # Convex hull of all text
+    hull = cv2.convexHull(pts)
+
+    # Fit minimum area rectangle
+    rect = cv2.minAreaRect(hull)
+    box = cv2.boxPoints(rect)
+
+    return np.array(box, dtype=np.float32)
+
+
+# -------------------------
+# PREPROCESSING
+# -------------------------
+def preprocess_image(frame):
+    img = cv2.resize(frame, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    denoised = cv2.fastNlMeansDenoising(gray, None, 30, 7, 21)
+
+    blur = cv2.GaussianBlur(denoised, (0, 0), 15)
+    normalized = cv2.divide(denoised, blur, scale=255)
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    contrast = clahe.apply(normalized)
+
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    sharpened = cv2.filter2D(contrast, -1, kernel)
+
+    return sharpened
+
+
+# -------------------------
+# PANEL DETECTION
+# -------------------------
+def detect_panel_with_ocr(image):
+    results = reader.readtext(image)
+
+    rects = []
+
+    for (bbox, text, conf) in results:
+        if not bbox or len(bbox) < 4:
+            continue
+
+        # Filter low-confidence text
+        if conf < 0.1:
+            continue
+
+        pts = np.array(bbox, dtype=np.int32)
+
+        if pts.shape != (4, 2):
+            continue
+
+        x, y, w, h = cv2.boundingRect(pts)
+
+        # Filter tiny noise
+        if w < 15 or h < 15:
+            continue
+
+        rects.append((x, y, w, h))
+
+    if not rects:
+        return image
+
+    # --- Remove outliers (important) ---
+    centers = np.array([(x + w/2, y + h/2) for (x, y, w, h) in rects])
+
+    mean = np.mean(centers, axis=0)
+    distances = np.linalg.norm(centers - mean, axis=1)
+
+    # Keep boxes near cluster center
+    threshold = np.percentile(distances, 90)
+    filtered = [rects[i] for i in range(len(rects)) if distances[i] < threshold]
+
+    if not filtered:
+        filtered = rects
+
+    # --- Compute tight bounding box ---
+    xs = [r[0] for r in filtered]
+    ys = [r[1] for r in filtered]
+    ws = [r[0] + r[2] for r in filtered]
+    hs = [r[1] + r[3] for r in filtered]
+
+    x_min = min(xs)
+    y_min = min(ys)
+    x_max = max(ws)
+    y_max = max(hs)
+
+    # --- Dynamic padding (smaller) ---
+    pad_x = int((x_max - x_min) * 0.03)
+    pad_y = int((y_max - y_min) * 0.03)
+
+    x_min = max(0, x_min - pad_x)
+    y_min = max(0, y_min - pad_y)
+    x_max = min(image.shape[1], x_max + pad_x)
+    y_max = min(image.shape[0], y_max + pad_y)
+
+    return image[y_min:y_max, x_min:x_max]
+# -------------------------
+# ROW GROUPING
+# -------------------------
+def group_into_rows(results, y_threshold=15):
+    rows = []
+    items = []
+
+    for (bbox, text, conf) in results:
+        if not bbox or len(bbox) < 4:
+            continue
+
+        pts = np.array(bbox, dtype=np.float32)
+
+        if pts.shape != (4, 2):
+            continue
+
+        y_center = np.mean(pts[:, 1])
+        items.append((y_center, text))
+
+    items.sort(key=lambda x: x[0])
+
+    current_row = []
+    current_y = None
+
+    for y, text in items:
+        if current_y is None:
+            current_row = [text]
+            current_y = y
+        elif abs(y - current_y) < y_threshold:
+            current_row.append(text)
         else:
-            # For calories, avoid percentage/DV lines.
-            if '%' in line or 'daily value' in line or 'dv' in line:
-                continue
-            # Avoid serving-size/context numbers near calories label.
-            if any(tok in line for tok in ("serving", "size", "pieces", "container", "per serving")):
-                continue
-            if re.search(r'\b\d+(?:\.\d+)?\s*(g|mg)\b', line):
-                continue
-            m = re.search(r'\b(\d{1,4})\b', line)
-            if m:
-                return m.group(1)
+            rows.append(" ".join(current_row))
+            current_row = [text]
+            current_y = y
 
-    return None
+    if current_row:
+        rows.append(" ".join(current_row))
 
-def parse_nutrients(text):
-    lines = [l.strip().lower() for l in text.splitlines() if l.strip()]
+    return rows
 
-    def normalize_units(line):
-        line = line.lower()
-        line = re.sub(r'(\d)\s*[q9o]\b', r'\1g', line)
-        line = re.sub(r'\b[il]\s*g\b', '1g', line)
-        line = re.sub(r'\bo\s*g\b', '0g', line)
-        line = re.sub(r'\bog\b', '0g', line)
-        return line
 
-    def extract_from_labeled_line(include_roots, exclude_roots=None, expect_g=False):
-        exclude_roots = exclude_roots or []
-        for i, line in enumerate(lines):
-            if not any(root in line for root in include_roots):
-                continue
-            if any(root in line for root in exclude_roots):
-                continue
+# -------------------------
+# NUTRIENT EXTRACTION
+# -------------------------
+def normalize_ocr_text(text):
+    """
+    Normalize OCR text to handle common character confusions.
+    
+    Handles OCR misrecognitions:
+    - Letter 'o' confused with '0' (zero)
+    - Letter 'l' or 'i' confused with '1' (one)
+    - Letter 'z' confused with '2' (two)
+    - Letter 'q' confused with 'g' in units
+    - Digit '9' confused with 'g' in units
+    - Missing spaces between value and unit
+    
+    Examples:
+    - "1og" → "1g" (1 + letter O + g)
+    - "i2g" → "12g" (letter i + 2 + g) 
+    - "z50" → "250" (letter z + 50)
+    - "1oo" → "100" (1 + letter O + letter O)
+    - "5q" → "5g" (5 + q → 5g)
+    """
+    text = text.lower().replace("'", "'")
+    text = re.sub(r"\s+", " ", text).strip()
+    
+    # 1. Fix 'o' between digit and 'g' or digit and other digits
+    # "1og" → "1g" (remove middle 'o' between digit and letter)
+    text = re.sub(r'(\d)o([g0-9])', r'\1\2', text)
+    
+    # 2. Fix other standalone 'o' → '0'
+    text = re.sub(r'\bo\b', '0', text)
+    
+    # 3. Fix 'z' → '2' in numbers (word boundary)
+    text = re.sub(r'\bz(\d)', r'2\1', text)  # "z50" → "250"
+    
+    # 4. Fix letter 'i' or 'l' at start of numbers → '1'
+    text = re.sub(r'\b[il](\d)', r'1\1', text)  # "i2g" → "12g", "l0" → "10"
+    
+    # 5. Fix gram unit confusions (q/9 → g after digit)
+    text = re.sub(r'(\d)\s*[q9]\b', r'\1g', text)  # "5q" → "5g", "35q" → "35g"
+    
+    # 6. Fix double 'o' in numeric context → '00'
+    text = re.sub(r'(\d)oo(\D|$)', r'\g<1>00\2', text)  # "1oo" → "100"
+    
+    return text
 
-            norm = normalize_units(line)
-            if expect_g:
-                m = re.search(r'(\d+(?:\.\d+)?)\s*g\b', norm)
-                if m:
-                    return m.group(1)
-                # Unit may be dropped by OCR; use same-line numeric fallback.
-                m = re.search(r'(\d+(?:\.\d+)?)', norm)
-                if m:
-                    return m.group(1)
-            else:
-                if '%' in norm or 'daily value' in norm or 'dv' in norm:
-                    continue
-                m = re.search(r'\b(\d{1,4})\b', norm)
-                if m:
-                    return m.group(1)
-                # Calories are commonly on the next line after the label.
-                for offset in [1, 2, -1, -2, 3, -3]:
-                    j = i + offset
-                    if not (0 <= j < len(lines)):
-                        continue
-                    candidate = normalize_units(lines[j])
-                    if '%' in candidate or 'daily value' in candidate or 'dv' in candidate:
-                        continue
-                    if any(tok in candidate for tok in ("serving", "size", "pieces", "container", "per serving")):
-                        continue
-                    if re.search(r'\b\d+(?:\.\d+)?\s*(g|mg)\b', candidate):
-                        continue
-                    m = re.search(r'\b(\d{1,4})\b', candidate)
-                    if m:
-                        return m.group(1)
-        return None
 
-    def extract_protein_from_labeled_line():
-        for line in lines:
-            if "prot" not in line:
-                continue
 
-            norm = normalize_units(line)
 
-            # Normal case: explicit gram unit.
-            m = re.search(r'(\d+(?:\.\d+)?)\s*g\b', norm)
-            if m:
-                return m.group(1)
 
-            # OCR often reads "1g" as "ig", "lg", "io", "lo", or "10".
-            if re.search(r'\b[il1]\s*[g0o]\b', norm) or re.search(r'\b10\b', norm):
-                return "1"
+def extract_value_candidates(line, expect_gram=False):
+    """
+    Extract numeric value candidates from a line with OCR confusion handling.
+    
+    Args:
+        line: Text line to extract from
+        expect_gram: True if expecting gram unit (e.g., "5g"), False for bare numbers
+        
+    Returns:
+        List of tuples: (value_str, has_unit_indicator)
+    """
+    line = normalize_ocr_text(line)
+    candidates = []
+    
+    if expect_gram:
+        # Accept OCR variants where g is confused as q/9/o/0
+        # Match: digit(s).digit(s) followed by optional space and g/q/9/o/0
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*([gq9o0])\b", line):
+            candidates.append((m.group(1), True))
+        
+        # If no gram-unit matches, try bare numbers
+        if not candidates:
+            for m in re.finditer(r"(\d+(?:\.\d+)?)", line):
+                candidates.append((m.group(1), False))
+    else:
+        # For non-gram (e.g., calories), match bare numbers only
+        for m in re.finditer(r"\b(\d{1,4})\b", line):
+            candidates.append((m.group(1), False))
+    
+    return candidates
 
-            # Last-resort same-line numeric fallback.
-            m = re.search(r'(\d+(?:\.\d+)?)', norm)
-            if m:
-                return m.group(1)
 
-        return None
-
-    calories = extract_from_labeled_line(["calor", "energy"], ["fat cal"], expect_g=False)
-    fat = extract_from_labeled_line(["fat"], ["saturated", "trans", "poly", "mono"], expect_g=True)
-    carbohydrates = extract_from_labeled_line(["carb"], ["fiber", "sugar", "added"], expect_g=True)
-    protein = extract_protein_from_labeled_line()
-
-    # Fallback to fuzzy-context parser only for missing nutrients.
-    if calories is None:
-        calories = extract_value_from_context(lines, find_best_index(lines, NUTRIENTS["calories"]), False)
-    if fat is None:
-        fat = extract_value_from_context(lines, find_best_index(lines, NUTRIENTS["fat"]), True)
-    if carbohydrates is None:
-        carbohydrates = extract_value_from_context(lines, find_best_index(lines, NUTRIENTS["carbohydrates"]), True)
-    if protein is None:
-        protein = extract_value_from_context(lines, find_best_index(lines, NUTRIENTS["protein"]), True)
-
-    return {
-        "calories": calories,
-        "fat": fat,
-        "carbohydrates": carbohydrates,
-        "protein": protein,
-    }
-
-# -----------------------
-# full pipeline
-# -----------------------
-def extract_nutrition(image_path):
-    crop = detect_label(image_path)
-    text = run_ocr(crop)
-    return parse_nutrients(text)
-
-# -----------------------
-# test
-# -----------------------
-if __name__ == "__main__":
-    image_path = capture_image_from_webcam("debug_meal_image.jpg")
-
-    print(f"\nTesting OCR on: {image_path}\n")
-
+def is_plausible_value(value, nutrient_key):
+    """Check if a numeric value is plausible for a given nutrient."""
     try:
-        result = extract_nutrition(image_path)
+        v = float(value)
+    except ValueError:
+        return False
+    
+    if nutrient_key == "calories":
+        return 0 <= v <= 2000
+    elif nutrient_key in ("fat", "carbohydrates", "protein"):
+        return 0 <= v <= 200
+    return True
 
-        print("\n--- FINAL EXTRACTED NUTRIENTS ---")
-        for k, v in result.items():
-            print(f"{k}: {v}")
 
+def extract_nutrients_from_rows(rows):
+    """
+    Extract nutrients from OCR rows with robust OCR confusion handling.
+    
+    Handles common OCR character confusions and uses context-aware scoring
+    to select the best value for each nutrient.
+    """
+    nutrients = {
+        "calories": None,
+        "fat": None,
+        "carbohydrates": None,
+        "protein": None,
+    }
+    
+    # Normalize all rows for case-insensitive matching
+    normalized_rows = [normalize_ocr_text(row) for row in rows]
+    
+    # Define nutrient patterns with aliases and extraction rules
+    nutrient_specs = {
+        "calories": {
+            "keywords": ["calories", "calorie", "energy"],
+            "expect_gram": False,
+            "exclude": ["saturated", "trans", "fat"],
+        },
+        "fat": {
+            "keywords": ["total fat", "fat", "totalfat"],
+            "expect_gram": True,
+            "exclude": ["saturated", "trans", "polyunsaturated", "monounsaturated"],
+        },
+        "carbohydrates": {
+            "keywords": ["carbohydrate", "carbohydrates", "carb", "carbs", "totalcarb"],
+            "expect_gram": True,
+            "exclude": ["fiber", "sugar", "added"],
+        },
+        "protein": {
+            "keywords": ["protein"],
+            "expect_gram": True,
+            "exclude": [],
+        },
+    }
+    
+    def matches_nutrient_keywords(line, keywords):
+        """Check if line contains any nutrient keywords."""
+        for keyword in keywords:
+            if keyword in line:
+                return True
+        return False
+    
+    def has_excluded_words(line, exclude_list):
+        """Check if line contains excluded words."""
+        for word in exclude_list:
+            if word in line:
+                return True
+        return False
+    
+    # Extract each nutrient
+    for nutrient_key, spec in nutrient_specs.items():
+        best_value = None
+        best_score = -1e9
+        
+        for idx, line in enumerate(normalized_rows):
+            # Check if this line mentions the nutrient
+            if not matches_nutrient_keywords(line, spec["keywords"]):
+                continue
+            
+            # Skip if line contains excluded terms
+            if has_excluded_words(line, spec["exclude"]):
+                continue
+            
+            # Try extracting from this line and nearby lines
+            search_contexts = [
+                (line, 0),  # Same line
+            ]
+            
+            # Add neighboring lines for context
+            if idx > 0:
+                search_contexts.append((normalized_rows[idx - 1] + " " + line, 1))
+            if idx + 1 < len(normalized_rows):
+                search_contexts.append((line + " " + normalized_rows[idx + 1], 1))
+            
+            # For calories, check further away lines (common layout)
+            if nutrient_key == "calories":
+                for offset in (-2, 2, -3, 3):
+                    j = idx + offset
+                    if 0 <= j < len(normalized_rows):
+                        search_contexts.append((normalized_rows[j], abs(offset)))
+            
+            # Extract candidates from all contexts
+            for context, distance in search_contexts:
+                candidates = extract_value_candidates(context, spec["expect_gram"])
+                
+                for value_str, has_unit in candidates:
+                    # Skip implausible values
+                    if not is_plausible_value(value_str, nutrient_key):
+                        continue
+                    
+                    # For gram-based nutrients, distrust unit-less values from other lines
+                    if spec["expect_gram"] and not has_unit and distance > 0:
+                        continue
+                    
+                    # Scoring: preference for same line, unit match, plausibility
+                    score = 10.0  # Base score for finding value
+                    if distance == 0:
+                        score += 5.0  # Same line bonus
+                    if has_unit and spec["expect_gram"]:
+                        score += 3.0  # Unit indicator bonus
+                    score -= distance * 0.5  # Distance penalty
+                    
+                    # Nutrient-specific penalties
+                    if nutrient_key == "calories":
+                        if "%" in context or "daily" in context:
+                            score -= 4.0  # Likely a percentage, not actual calories
+                        if "serving" in context or "per" in context:
+                            score -= 2.0
+                        if "." in value_str:
+                            score -= 1.0  # Calories rarely have decimals
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_value = value_str
+        
+        nutrients[nutrient_key] = best_value
+    
+    return nutrients
+
+
+
+
+# -------------------------
+# PIPELINE
+# -------------------------
+def extract_text_pipeline(frame):
+    contour = detect_document_contour(frame)
+
+    if contour is not None:
+        warped = perspective_transform(frame, contour)
+
+        # DEBUG: show detected contour
+        debug = frame.copy()
+        cv2.polylines(debug, [contour.astype(int)], True, (0, 255, 0), 3)
+        cv2.imshow("Detected Contour", debug)
+
+    else:
+        warped = detect_panel_with_ocr(frame)  # fallback
+
+    cropped = detect_panel_with_ocr(warped)
+    processed = preprocess_image(cropped)
+
+    results = reader.readtext(processed)
+
+    rows = group_into_rows(results)
+    nutrients = extract_nutrients_from_rows(rows)
+
+    return rows, nutrients, cropped, results, warped
+
+
+# -------------------------
+# MAIN
+# -------------------------
+def extract_nutrition(image_path):
+    """
+    Extract nutrition information from an image file using EasyOCR.
+    
+    Args:
+        image_path: Path to the nutrition label image
+        
+    Returns:
+        Dictionary with extracted nutrition data (calories, fat, carbohydrates, protein)
+    """
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    
+    # Read image from file
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not read image from: {image_path}")
+    
+    try:
+        # Run extraction pipeline
+        rows, nutrients, cropped, results, warped = extract_text_pipeline(image)
+        
+        return nutrients
     except Exception as e:
-        print(f"Error: {e}")
+        raise ValueError(f"Error extracting nutrition from image: {str(e)}")

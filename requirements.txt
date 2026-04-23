@@ -1,22 +1,11 @@
-# enable GPU support for PyTorch
---index-url https://download.pytorch.org/whl/cu124
---extra-index-url https://pypi.org/simple
-
-langchain
-langchain-community
-python-dotenv
-pydantic
+datasets
 groq
 numpy==1.26.4
 opencv-python==4.6.0.66
 ultralytics 
-paddlepaddle==2.6.2
-paddleocr==2.7.3
-rapidfuzz
 datasets 
 pillow 
 torch 
 torchvision
 torchaudio
-pytesseract
 mediapipe
